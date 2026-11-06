@@ -327,20 +327,34 @@ async function startAgent(cfg, logger) {
     logger.log('NEZHA variable is empty, skip running nezha agent');
     return null;
   }
-  if (!await downloadAgent(agent, logger)) return agent;
+  if (!await downloadAgent(agent, logger)) {
+    agent.status = 'failed';
+    return agent;
+  }
   agent.child = runAgent(agent, logger);
   agent.cleanupTimer = scheduleCleanup(agent, logger);
+  agent.status = 'running';
   return agent;
 }
 
 // ============================== 网页服务 ==============================
-const INDEX_PATH = path.join(__dirname, 'index.html');
+// 交付物名单只在这里定义: 路由、500 文案、自检、测试都指向它
+const ASSETS = Object.freeze({ page: 'index.html' });
+const INDEX_PATH = path.join(__dirname, ASSETS.page);
+
+// 部署自检: 只报真正可能漏拷的首页, 纯报告（由 500 降级兑底）
+function reportMissingAssets(logger) {
+  const target = path.join(__dirname, ASSETS.page);
+  if (!fs.existsSync(target)) {
+    logger.err(`缺少文件 ${target} (cwd=${process.cwd()})`);
+  }
+}
 
 function serveIndex(req, res) {
   fs.readFile(INDEX_PATH, (error, data) => {
     if (error) {
       res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
-      res.end('index.html missing');
+      res.end(`${ASSETS.page} missing`);
       return;
     }
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache' });
@@ -360,7 +374,7 @@ function notFound(req, res) {
 
 const ROUTES = {
   '/': serveIndex,
-  '/index.html': serveIndex,
+  [`/${ASSETS.page}`]: serveIndex,
   '/health': serveHealth,
   '/healthz': serveHealth
 };
@@ -371,13 +385,21 @@ function handleRequest(req, res) {
 }
 
 // ================================ 启动 ================================
-// 每次调用都创建独立实例: 端口与日志都在调用时解析, 不冻结在 import 期
-function start(env = process.env) {
+// 配置与 logger 只造一次: CLI 与库入口共用 prepare
+function prepare(env) {
   const { cfg, warnings } = resolveConfig(env);
   const logger = createLogger(cfg.showLog);
-
   warnings.forEach(warning => logger.err(warning));
+  return { cfg, logger };
+}
 
+// 每次调用都创建独立实例: 端口与日志都在调用时解析, 不冻结在 import 期
+function start(env = process.env) {
+  const { cfg, logger } = prepare(env);
+  return launch(cfg, logger);
+}
+
+function launch(cfg, logger) {
   ensureDir(cfg.filePath);
   cleanupOldFiles(cfg.filePath);
 
@@ -386,23 +408,48 @@ function start(env = process.env) {
   server.listen(cfg.httpPort, () => logger.log(`http server is running on ${server.address().port}!`));
 
   // 探针生命周期交给调用方: agent 可等待/查询, cancel 可提前取消 90s 清理
-  const state = { agent: null };
+  // agent 结果三态: null(未配置) / { status:'failed' } / { status:'running' }
+  const state = { agent: null, settled: false, cancelRequested: false };
   const agent = startAgent(cfg, logger)
-    .then(result => { state.agent = result; return result; })
-    .catch(error => { logger.err(`nezha agent error: ${error.message}`); return null; });
+    .then(result => {
+      state.agent = result;
+      // 提前调用过 cancel: agent 就绪后立即兑现, 不给 90s 清理留下窗口
+      if (state.cancelRequested && result && result.cleanupTimer) {
+        clearTimeout(result.cleanupTimer);
+        result.cleanupTimer = null;
+      }
+      return result;
+    })
+    .catch(error => {
+      logger.err(`nezha agent error: ${error.message}`);
+      return { status: 'error', error };
+    })
+    .finally(() => { state.settled = true; });
 
+  // 返回值可判别: 'now' 已取消 / 'pending' 已排队(agent 未就绪) / 'none' 无可取消
   const cancel = () => {
-    if (!state.agent || !state.agent.cleanupTimer) return false;
+    if (!state.settled) {
+      state.cancelRequested = true;
+      return 'pending';
+    }
+    if (!state.agent || !state.agent.cleanupTimer) return 'none';
     clearTimeout(state.agent.cleanupTimer);
     state.agent.cleanupTimer = null;
-    return true;
+    return 'now';
   };
 
   return { server, agent, cancel };
 }
 
+// CLI 入口: 部署自检只在这里做, 不污染把 start() 当库调用的宿主
+function main(env = process.env) {
+  const { cfg, logger } = prepare(env);
+  reportMissingAssets(logger);
+  return launch(cfg, logger);
+}
+
 if (require.main === module) {
-  start();
+  main();
 }
 
 module.exports = {
@@ -412,6 +459,8 @@ module.exports = {
   buildAgent,
   // 仅测试使用
   __test: {
+    ASSETS,
+    reportMissingAssets,
     createLogger,
     cleanupOldFiles,
     isOwnedFile,
