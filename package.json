@@ -1,0 +1,16 @@
+{
+  "name": "nodejs-nezha",
+  "version": "1.0.0",
+  "description": "Static landing page + Nezha agent (no tunnel proxy)",
+  "main": "index.js",
+  "license": "MIT",
+  "private": false,
+  "scripts": {
+    "dev": "node index.js",
+    "start": "node index.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=14"
+  }
+}
